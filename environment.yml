@@ -1,0 +1,52 @@
+name: cuttag-pipeline
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # Python
+  - python=3.11
+
+  # QC
+  - fastqc=0.12.1
+  - multiqc=1.21
+
+  # Trimming
+  - cutadapt=4.7
+
+  # Alignment
+  - bowtie2=2.5.3
+  - samtools=1.19.2
+
+  # Deduplication
+  - picard=3.1.1
+  - umi_tools=1.1.5
+
+  # Filtering
+  - bedtools=2.31.1
+
+  # Signal tracks & QC visualization
+  - deeptools=3.5.4
+
+  # Peak calling
+  - macs3=3.0.1
+
+  # R and Bioconductor (for ChIPseeker annotation)
+  - r-base=4.3.3
+  - r-optparse
+  - r-ggplot2
+  - r-dplyr
+  - bioconductor-chipseeker=1.38.0
+  - bioconductor-genomicfeatures
+  - bioconductor-txdbmaker
+  - bioconductor-org.hs.eg.db
+  - bioconductor-org.mm.eg.db
+
+  # Python packages
+  - pip
+
+  - pip:
+    - pyyaml>=6.0
+    - pandas>=2.0
+    - numpy>=1.24
