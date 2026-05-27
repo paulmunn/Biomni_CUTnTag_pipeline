@@ -22,6 +22,7 @@ Validation rules enforced:
 
 import argparse
 import csv
+import re as _re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -37,6 +38,11 @@ OPTIONAL_COLUMNS = ['notes']
 
 VALID_PEAK_MODES = {'narrow', 'broad', 'auto', ''}
 VALID_IS_CONTROL = {'true', 'false'}
+
+
+def _strip_lane(sid):
+    """Strip trailing _L<digits> lane suffix for fuzzy matching."""
+    return _re.sub(r'_L\d+$', '', sid)
 
 
 def load_csv(path: str) -> list:
@@ -60,7 +66,9 @@ def load_tsv(path: str) -> list:
 def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
              allow_extra: bool) -> tuple:
     """
-    Returns (errors, warnings) as lists of strings.
+    Returns (errors, warnings, assoc_to_fastq) where assoc_to_fastq is a
+    dict mapping each CSV sample_id to its matched FASTQ-derived sample_id
+    (or None if no match was found).
     """
     errors   = []
     warnings = []
@@ -68,7 +76,7 @@ def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
     # ── 1. Required columns ──────────────────────────────────────────────────
     if not assoc_rows:
         errors.append("Association CSV is empty.")
-        return errors, warnings
+        return errors, warnings, {}
 
     actual_cols = set(assoc_rows[0].keys())
     missing_cols = [c for c in REQUIRED_COLUMNS if c not in actual_cols]
@@ -78,7 +86,7 @@ def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
             f"  Required: {REQUIRED_COLUMNS}\n"
             f"  Found:    {sorted(actual_cols)}"
         )
-        return errors, warnings  # Cannot continue without required columns
+        return errors, warnings, {}  # Cannot continue without required columns
 
     # ── 2. Duplicate sample_id ───────────────────────────────────────────────
     sample_ids = [r['sample_id'] for r in assoc_rows]
@@ -91,22 +99,46 @@ def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
     assoc_by_id = {r['sample_id']: r for r in assoc_rows}
 
     # ── 3. FASTQ pairs cross-check ───────────────────────────────────────────
-    fastq_ids = {r['sample_id'] for r in pairs_rows if r.get('status') == 'OK'}
-    assoc_ids = set(assoc_by_id.keys())
+    fastq_ids      = {r['sample_id'] for r in pairs_rows if r.get('status') == 'OK'}
+    assoc_ids      = set(assoc_by_id.keys())
 
-    missing_in_assoc = fastq_ids - assoc_ids
+    # Normalised (lane-stripped) versions
+    fastq_ids_norm = {_strip_lane(s): s for s in fastq_ids}   # norm -> original
+    assoc_ids_norm = {_strip_lane(s): s for s in assoc_ids}   # norm -> original
+
+    # Build a mapping: assoc sample_id -> matched fastq sample_id (or None)
+    assoc_to_fastq = {}
+    for assoc_sid in assoc_ids:
+        norm = _strip_lane(assoc_sid)
+        if assoc_sid in fastq_ids:
+            assoc_to_fastq[assoc_sid] = assoc_sid          # exact match
+        elif norm in fastq_ids_norm:
+            assoc_to_fastq[assoc_sid] = fastq_ids_norm[norm]  # lane-normalised match
+        else:
+            assoc_to_fastq[assoc_sid] = None               # no match
+
+    # FASTQ IDs with no CSV match (exact or normalised)
+    matched_fastq_ids = set(assoc_to_fastq.values()) - {None}
+    missing_in_assoc = fastq_ids - matched_fastq_ids
     for sid in sorted(missing_in_assoc):
         errors.append(
-            f"Sample '{sid}' found in FASTQ pairs but missing from association CSV."
+            f"Sample '{sid}' found in FASTQ pairs but missing from association CSV. "
+            f"Add this sample_id to your association CSV, or check for a lane-suffix "
+            f"mismatch (FASTQ-derived ID vs CSV sample_id)."
         )
 
-    extra_in_assoc = assoc_ids - fastq_ids
-    for sid in sorted(extra_in_assoc):
-        msg = f"Sample '{sid}' in association CSV has no matching FASTQ pair."
-        if allow_extra:
-            warnings.append(msg + " (allowed by --allow_extra)")
-        else:
-            errors.append(msg + " Add --allow_extra to suppress this error.")
+    # CSV IDs with no FASTQ match
+    for assoc_sid, fastq_sid in sorted(assoc_to_fastq.items()):
+        if fastq_sid is None:
+            msg = f"Sample '{assoc_sid}' in association CSV has no matching FASTQ pair."
+            if allow_extra:
+                warnings.append(msg + " (allowed by --allow_extra)")
+            else:
+                errors.append(msg + " Add --allow_extra to suppress this error.")
+
+    # Build a corrected sample_id map for downstream use (assoc_sid -> fastq_sid)
+    # so the validated CSV uses the FASTQ-derived sample_id (without lane suffix)
+    # when there is a lane-normalised match.
 
     # ── 4. Field value validation ────────────────────────────────────────────
     for i, row in enumerate(assoc_rows, start=2):
@@ -135,6 +167,16 @@ def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
                 )
 
     # ── 5. Control group resolution ──────────────────────────────────────────
+    # control_group_ids: the set of group_id values from control rows.
+    # Treatment rows must have control_group_id that exactly matches one of these.
+    #
+    # IMPORTANT for CSV authors:
+    #   Control samples should have their `group_id` set to the SHARED GROUP NAME
+    #   that treatment samples will reference in `control_group_id`.
+    #   Example: if three IgG controls belong to group "HEK293_IgG", set
+    #   group_id = "HEK293_IgG" on all three control rows, and set
+    #   control_group_id = "HEK293_IgG" on all treatment rows that use them.
+    #   Do NOT use the sample_id as the group_id for controls.
     control_group_ids = {
         r['group_id']
         for r in assoc_rows
@@ -156,11 +198,28 @@ def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
                         "Set --allow_no_control to allow control-free peak calling."
                     )
             elif ctrl_id not in control_group_ids:
-                errors.append(
-                    f"Sample '{row['sample_id']}' references control_group_id "
-                    f"'{ctrl_id}' which does not match any control sample's group_id. "
-                    f"Available control group_ids: {sorted(control_group_ids)}"
-                )
+                # Try substring / prefix match as fallback
+                substring_matches = [
+                    gid for gid in control_group_ids
+                    if ctrl_id in gid or gid in ctrl_id
+                ]
+                if substring_matches:
+                    warnings.append(
+                        f"Sample '{row['sample_id']}' references control_group_id "
+                        f"'{ctrl_id}' which does not exactly match any control group_id, "
+                        f"but partially matches: {substring_matches}. "
+                        f"Consider updating the control rows' group_id to '{ctrl_id}' "
+                        f"so that all controls in the same IgG group share one group_id."
+                    )
+                else:
+                    errors.append(
+                        f"Sample '{row['sample_id']}' references control_group_id "
+                        f"'{ctrl_id}' which does not match any control sample's group_id. "
+                        f"Available control group_ids: {sorted(control_group_ids)}\n"
+                        f"  FIX: Set the group_id of each control sample to the shared "
+                        f"group name (e.g. '{ctrl_id}'). All controls in the same IgG/input "
+                        f"group should share the same group_id value."
+                    )
 
     # ── 6. merge_group_id consistency ────────────────────────────────────────
     merge_groups = defaultdict(list)
@@ -198,12 +257,15 @@ def validate(assoc_rows: list, pairs_rows: list, allow_no_control: bool,
 
     for grp_id, reps in group_replicates.items():
         if len(reps) != len(set(reps)):
-            dup_reps = [r for r in reps if reps.count(r) > 1]
+            dup_reps = [r for r in set(reps) if reps.count(r) > 1]
             errors.append(
-                f"group_id '{grp_id}' has duplicate replicate values: {dup_reps}"
+                f"group_id '{grp_id}' has duplicate replicate values: {dup_reps}. "
+                f"Each sample within a group_id must have a unique replicate value "
+                f"(e.g. 1, 2, 3). If these are biological replicates, assign "
+                f"replicate=1, replicate=2, etc."
             )
 
-    return errors, warnings
+    return errors, warnings, assoc_to_fastq
 
 
 def write_report(errors: list, warnings: list, report_path: str,
@@ -264,7 +326,7 @@ def main():
     assoc_rows = load_csv(args.association_csv)
     pairs_rows = load_tsv(args.pairs_tsv)
 
-    errors, warnings = validate(
+    errors, warnings, assoc_to_fastq = validate(
         assoc_rows, pairs_rows,
         allow_no_control=args.allow_no_control,
         allow_extra=args.allow_extra
@@ -292,8 +354,11 @@ def main():
                                 extrasaction='ignore')
         writer.writeheader()
         for row in assoc_rows:
-            # Normalize is_control and peak_calling_mode
-            row['is_control']       = row['is_control'].lower()
+            row = dict(row)  # copy
+            fastq_sid = assoc_to_fastq.get(row['sample_id'])
+            if fastq_sid is not None:
+                row['sample_id'] = fastq_sid  # use FASTQ-derived ID (lane-stripped)
+            row['is_control']        = row['is_control'].lower()
             row['peak_calling_mode'] = row['peak_calling_mode'].lower() or 'narrow'
             writer.writerow(row)
 

@@ -2,6 +2,14 @@
 // modules/fastqc.nf
 // Run FastQC on paired-end FASTQ files
 // ============================================================
+// Output design note:
+//   FastQC outputs are declared with EXPLICIT file names (no globs).
+//   Glob outputs (path("*.zip")) emit DataflowStream objects in DSL2,
+//   which carry a PoisonPill terminator that propagates into .collect()
+//   and causes "Not a valid path value type: DataflowStreamReadAdapter".
+//   By renaming inputs to known names and declaring exact output paths,
+//   we guarantee plain Path values are emitted.
+// ============================================================
 
 process FASTQC {
     tag "${sample_id}:${stage}"
@@ -16,9 +24,12 @@ process FASTQC {
     val  stage
 
     output:
-    tuple val(sample_id), path("*.html"), emit: html
-    tuple val(sample_id), path("*.zip"),  emit: zip
-    path "versions.yml",                  emit: versions
+    // Explicit named outputs — NO globs — to avoid DataflowStream emission
+    tuple val(sample_id), path("${sample_id}_${stage}_R1_fastqc.html"),
+                          path("${sample_id}_${stage}_R2_fastqc.html"), emit: html
+    tuple val(sample_id), path("${sample_id}_${stage}_R1_fastqc.zip"),
+                          path("${sample_id}_${stage}_R2_fastqc.zip"),  emit: zip
+    path "versions.yml",                                                 emit: versions
 
     script:
     def prefix = "${sample_id}_${stage}"

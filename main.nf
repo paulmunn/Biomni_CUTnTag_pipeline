@@ -43,6 +43,7 @@ params.effective_genome_size = 2913022398  // hg38 default; override for other g
 params.macs3_qvalue         = 0.05
 params.macs3_genome         = "hs"      // hs | mm | ce | dm
 params.allow_no_control     = false
+params.allow_extra_samples  = false   // Allow association CSV rows with no matching FASTQ pair
 
 // TSS / deepTools
 params.tss_window           = 2000
@@ -185,21 +186,6 @@ include { READ_RETENTION_SUMMARY }   from './modules/read_retention'
 include { MAKE_MQC_CUSTOM }          from './modules/make_mqc_custom'
 include { VERSION_LOG }              from './modules/version_log'
 
-// ── Helper: parse association CSV into a map ─────────────────
-def parseAssociationCSV(csv_file) {
-    def rows = []
-    def header = null
-    csv_file.eachLine { line ->
-        if (line.startsWith('#') || line.trim().isEmpty()) return
-        def fields = line.trim().split(',', -1)
-        if (!header) { header = fields; return }
-        def row = [:]
-        header.eachWithIndex { col, i -> row[col.trim()] = (i < fields.size()) ? fields[i].trim() : '' }
-        rows << row
-    }
-    return rows
-}
-
 // ── Main workflow ────────────────────────────────────────────
 workflow {
 
@@ -221,8 +207,13 @@ workflow {
     VERSION_LOG()
 
     // ── Step 1: Detect and validate FASTQ pairs ────────────
+    // Pass input_dir as a plain string (val), not file(), so that
+    // pair_fastqs.py receives the real filesystem path and can
+    // recursively search all subdirectories with Path.rglob().
+    // Absolute path resolution is done here to guard against
+    // relative paths being misinterpreted inside the work directory.
     PAIR_FASTQS(
-        file(params.input_dir),
+        file(params.input_dir).toAbsolutePath().toString(),
         params.paired_pattern
     )
 
@@ -247,8 +238,19 @@ workflow {
         }
 
     // ── Load association metadata ─────────────────────────
+    // Filter to only the samples whose genome column matches --genome.
+    // This allows a single association CSV to cover a multi-species
+    // experiment; each pipeline invocation processes one genome at a time.
     ch_assoc = Channel.fromPath(params.association_csv)
         .splitCsv(header: true)
+        .filter { row ->
+            def keep = row.genome?.trim() == params.genome?.trim()
+            if (!keep) {
+                log.info "Skipping sample '${row.sample_id}' " +
+                         "(genome='${row.genome}' != --genome '${params.genome}')"
+            }
+            keep
+        }
         .map { row ->
             [
                 row.sample_id,
@@ -281,8 +283,15 @@ workflow {
 
     FASTQC_RAW(ch_raw_reads, "raw")
 
+    // Extract bare zip paths from the FASTQC tuple output.
+    // FASTQC now emits tuple(val(id), path(r1_zip), path(r2_zip)) —
+    // two explicit named paths, NOT a glob list — so we extract both
+    // path values and flatten into a single stream of bare path values.
+    ch_fastqc_raw_paths = FASTQC_RAW.out.zip
+        .flatMap { id, r1_zip, r2_zip -> [r1_zip, r2_zip] }
+
     MULTIQC_RAW(
-        FASTQC_RAW.out.zip.collect(),
+        ch_fastqc_raw_paths.collect(),
         "raw",
         "${params.outdir}/13_multiqc/01_raw"
     )
@@ -292,8 +301,14 @@ workflow {
 
     FASTQC_TRIMMED(CUTADAPT.out.trimmed_reads, "trimmed")
 
+    // CUTADAPT.out.log emits a bare path; FASTQC_TRIMMED.out.zip emits tuples.
+    // FASTQC now emits tuple(val(id), path(r1_zip), path(r2_zip)) — two
+    // explicit named paths — so flatMap extracts both into a bare path stream.
+    ch_fastqc_trim_paths = FASTQC_TRIMMED.out.zip
+        .flatMap { id, r1_zip, r2_zip -> [r1_zip, r2_zip] }
+
     MULTIQC_TRIM(
-        FASTQC_TRIMMED.out.zip.mix(CUTADAPT.out.log).collect(),
+        ch_fastqc_trim_paths.mix(CUTADAPT.out.log).collect(),
         "trimmed",
         "${params.outdir}/13_multiqc/02_trimmed"
     )
@@ -303,9 +318,13 @@ workflow {
         .map { id, r1, r2 -> [id, r1, r2] }
         .join(ch_samples_meta.map { id, r1, r2, assoc -> [id, assoc] }, by: 0)
 
+    // Pass bowtie2_index as a plain string (val), NOT file(), so that
+    // Nextflow does not try to stage the prefix as a path.  The index
+    // files (hg38.1.bt2, hg38.2.bt2, …) share a common prefix and
+    // there is no file/directory literally named by that prefix.
     BOWTIE2_ALIGN(
         CUTADAPT.out.trimmed_reads,
-        file(params.bowtie2_index)
+        params.bowtie2_index
     )
 
     SAMTOOLS_SORT_INDEX(BOWTIE2_ALIGN.out.bam)
@@ -327,19 +346,22 @@ workflow {
     }
 
     // 6c. Deduplication
+    // ch_dedup_metrics is assigned INSIDE the if/else so that only the
+    // invoked process's .out channel is ever referenced.  Using a ternary
+    // operator outside the if/else would wire BOTH process outputs into the
+    // dataflow graph, causing the un-invoked branch to emit a DataflowStream
+    // containing only a PoisonPill — which then poisons any downstream .collect().
     if (params.dedup_mode == 'umi_tools' && !params.skip_umi) {
         UMI_TOOLS_DEDUP(ch_for_dedup)
-        ch_final_bam = UMI_TOOLS_DEDUP.out.bam_bai
+        ch_final_bam    = UMI_TOOLS_DEDUP.out.bam_bai
+        ch_dedup_metrics = UMI_TOOLS_DEDUP.out.metrics
     } else {
         PICARD_MARKDUPLICATES(ch_for_dedup)
-        ch_final_bam = PICARD_MARKDUPLICATES.out.bam_bai
+        ch_final_bam    = PICARD_MARKDUPLICATES.out.bam_bai
+        ch_dedup_metrics = PICARD_MARKDUPLICATES.out.metrics
     }
 
     // 6d. Read retention summary
-    // Collect dedup metrics from whichever dedup mode was used
-    ch_dedup_metrics = (params.dedup_mode == 'umi_tools' && !params.skip_umi)
-        ? UMI_TOOLS_DEDUP.out.metrics
-        : PICARD_MARKDUPLICATES.out.metrics
 
     ch_read_counts = SAMTOOLS_FLAGSTAT.out.stats
         .join(FILTER_MITO.out.stats, by: 0)
@@ -368,23 +390,7 @@ workflow {
     ch_treatment_samples = ch_final_bam_meta
         .filter { id, bam, bai, assoc -> !assoc.is_control }
 
-    ch_control_samples = ch_final_bam_meta
-        .filter { id, bam, bai, assoc -> assoc.is_control }
-        .map { id, bam, bai, assoc -> [assoc.group_id, bam, bai] }
-
-    // Match each treatment sample to its control
-    ch_sample_with_control = ch_treatment_samples
-        .map { id, bam, bai, assoc ->
-            [assoc.control_group_id, id, bam, bai, assoc]
-        }
-        .combine(ch_control_samples, by: 0)
-        .map { ctrl_grp_id, id, bam, bai, assoc, ctrl_bam, ctrl_bai ->
-            [id, bam, bai, ctrl_bam, ctrl_bai, assoc]
-        }
-
-    MACS3_CALLPEAK_SAMPLE(ch_sample_with_control)
-
-    // ── Step 9: Group-level peak calling ──────────────────
+    // ── Step 9: Group-level BAM merging ───────────────────
     // Group treatment BAMs by merge_group_id
     // Emit: [merge_group_id, [bam_list], [bai_list], ctrl_group_id, peak_mode]
     ch_merge_groups = ch_final_bam_meta
@@ -423,6 +429,24 @@ workflow {
     // Build lookup: ctrl_group_id -> [merged_ctrl_bam, merged_ctrl_bai]
     ch_merged_ctrl_lookup = MERGE_CONTROL_BAMS.out.merged_bam
         .map { ctrl_id, bam, bai, type -> tuple(ctrl_id, bam, bai) }
+
+    // ── Step 8: Per-sample peak calling ───────────────────
+    // Use the MERGED control BAM (not individual control replicates) so
+    // that each treatment sample is matched to exactly one control entry.
+    // Using individual control BAMs with .combine() would produce one row
+    // per control replicate, causing MACS3 to run multiple times per
+    // treatment sample and generating duplicate *_peak_stats.txt filenames
+    // that collide when staged into MAKE_MQC_CUSTOM.
+    ch_sample_with_control = ch_treatment_samples
+        .map { id, bam, bai, assoc ->
+            [assoc.control_group_id, id, bam, bai, assoc]
+        }
+        .join(ch_merged_ctrl_lookup, by: 0)
+        .map { ctrl_grp_id, id, bam, bai, assoc, ctrl_bam, ctrl_bai ->
+            [id, bam, bai, ctrl_bam, ctrl_bai, assoc]
+        }
+
+    MACS3_CALLPEAK_SAMPLE(ch_sample_with_control)
 
     // Join merged treatment BAMs with their ctrl_group_id metadata,
     // then join with the merged control BAM on ctrl_group_id
@@ -469,7 +493,10 @@ workflow {
 
     // ── Step 12: deepTools QC ─────────────────────────────
     if (params.tss_bed) {
-        ch_bigwigs_for_matrix = BAMCOVERAGE_BIGWIG.out.bigwig.collect { id, bw -> bw }
+        // Extract bare BigWig paths from tuple(val(id), path(bw)) channel
+        ch_bigwigs_for_matrix = BAMCOVERAGE_BIGWIG.out.bigwig
+            .map { id, bw -> bw }
+            .collect()
 
         COMPUTE_MATRIX_TSS(
             ch_bigwigs_for_matrix,
@@ -482,11 +509,13 @@ workflow {
     }
 
     // Peak-center matrix using group-level peaks
+    // Extract bare paths from tuple channels before passing to computeMatrix
     ch_group_peaks_for_matrix = MACS3_CALLPEAK_GROUP.out.peaks
-        .collect { id, peak -> peak }
+        .map { id, peak -> peak }
+        .collect()
 
     COMPUTE_MATRIX_PEAKS(
-        BAMCOVERAGE_BIGWIG.out.bigwig.collect { id, bw -> bw },
+        BAMCOVERAGE_BIGWIG.out.bigwig.map { id, bw -> bw }.collect(),
         ch_group_peaks_for_matrix,
         params.peak_center_window
     )
@@ -495,17 +524,37 @@ workflow {
     PLOT_HEATMAP_PEAKS(COMPUTE_MATRIX_PEAKS.out.matrix, "peaks")
 
     // ── Step 13: MultiQC custom content ───────────────────
+    // MAKE_MQC_CUSTOM receives flat lists of bare path files.
+    // All four source channels emit tuple(val(id), path(file)) —
+    // extract the path element from each before collecting.
+    // Deduplicate peak stats by sample_id before collecting.
+    // ch_sample_with_control is built with .combine(), which can produce
+    // multiple rows for the same treatment sample if the control-matching
+    // logic yields more than one hit.  That causes MACS3_CALLPEAK_SAMPLE
+    // to run (or cache) multiple times for the same sample_id, emitting
+    // duplicate *_peak_stats.txt paths with identical basenames.
+    // Nextflow then raises a "file name collision" error when staging them
+    // all into MAKE_MQC_CUSTOM's flat input directory.
+    // .unique { id, f -> id } keeps only the first emission per sample_id.
+    ch_peak_stats_dedup = MACS3_CALLPEAK_SAMPLE.out.stats
+        .unique { id, f -> id }
+        .map    { id, f -> f }
+        .collect()
+
     MAKE_MQC_CUSTOM(
-        READ_RETENTION_SUMMARY.out.tsv.collect(),
-        FRIP_SCORE.out.tsv.collect(),
-        MACS3_CALLPEAK_SAMPLE.out.stats.collect(),
-        SAMTOOLS_FLAGSTAT.out.stats.collect()
+        READ_RETENTION_SUMMARY.out.tsv.map    { id, f -> f }.collect(),
+        FRIP_SCORE.out.tsv.map                { id, f -> f }.collect(),
+        ch_peak_stats_dedup,
+        SAMTOOLS_FLAGSTAT.out.stats.map       { id, f -> f }.collect()
     )
 
     // ── Step 14: Final MultiQC reports ────────────────────
-    ch_align_qc = SAMTOOLS_FLAGSTAT.out.stats
-        .mix(SAMTOOLS_IDXSTATS.out.stats)
-        .mix(SAMTOOLS_STATS.out.stats)
+    // ── MultiQC alignment report ───────────────────────────
+    // All three samtools channels emit tuple(val(id), path(file)).
+    // Extract the path element from each before mixing and collecting.
+    ch_align_qc = SAMTOOLS_FLAGSTAT.out.stats.map { id, f -> f }
+        .mix(SAMTOOLS_IDXSTATS.out.stats.map { id, f -> f })
+        .mix(SAMTOOLS_STATS.out.stats.map    { id, f -> f })
         .collect()
 
     MULTIQC_ALIGN(
@@ -514,13 +563,33 @@ workflow {
         "${params.outdir}/13_multiqc/03_alignment"
     )
 
-    ch_final_mqc = FASTQC_RAW.out.zip
-        .mix(FASTQC_TRIMMED.out.zip)
-        .mix(CUTADAPT.out.log)
-        .mix(SAMTOOLS_FLAGSTAT.out.stats)
-        .mix(SAMTOOLS_STATS.out.stats)
-        .mix(PICARD_MARKDUPLICATES.out.metrics.ifEmpty(Channel.empty()))
-        .mix(MAKE_MQC_CUSTOM.out.all_mqc)
+    // ── Final integrated MultiQC report ───────────────────
+    // Build a flat channel of bare path values from every QC source.
+    // Rule: every tuple channel needs .map { id, f -> f } (or
+    // .map { id, files -> files }.flatten() for multi-file tuples)
+    // before being mixed. Bare-path channels (CUTADAPT.out.log,
+    // MAKE_MQC_CUSTOM.out.all_mqc) can be mixed in directly.
+
+    // Dedup metrics for MultiQC: use ch_dedup_metrics which was already
+    // set to whichever dedup process was actually invoked (Picard or UMI-tools).
+    // NEVER reference PICARD_MARKDUPLICATES.out or UMI_TOOLS_DEDUP.out directly
+    // here — referencing .out on an un-invoked process returns a DataflowStream
+    // containing only a PoisonPill, which poisons the entire .collect() call.
+    ch_dedup_mqc_paths = ch_dedup_metrics.map { id, f -> f }
+
+    // Use individually-named MAKE_MQC_CUSTOM outputs instead of the glob
+    // all_mqc emit, which produced a DataflowStream that leaked PoisonPill
+    // into the collected list.  Each named output is a single path value.
+    ch_final_mqc = ch_fastqc_raw_paths
+        .mix( ch_fastqc_trim_paths )
+        .mix( CUTADAPT.out.log )
+        .mix( SAMTOOLS_FLAGSTAT.out.stats.map { id, f -> f } )
+        .mix( SAMTOOLS_STATS.out.stats.map    { id, f -> f } )
+        .mix( ch_dedup_mqc_paths )
+        .mix( MAKE_MQC_CUSTOM.out.retention_mqc )
+        .mix( MAKE_MQC_CUSTOM.out.frip_mqc )
+        .mix( MAKE_MQC_CUSTOM.out.peaks_mqc )
+        .mix( MAKE_MQC_CUSTOM.out.mito_mqc )
         .collect()
 
     MULTIQC_FINAL(
@@ -528,17 +597,5 @@ workflow {
         "final",
         "${params.outdir}/13_multiqc/04_final"
     )
-
-    // ── Completion message ─────────────────────────────────
-    workflow.onComplete {
-        log.info """
-        ╔══════════════════════════════════════════════════════════╗
-        ║              Pipeline completed successfully!            ║
-        ╚══════════════════════════════════════════════════════════╝
-        Duration    : ${workflow.duration}
-        Success     : ${workflow.success}
-        Work dir    : ${workflow.workDir}
-        Output dir  : ${params.outdir}
-        """.stripIndent()
-    }
 }
+

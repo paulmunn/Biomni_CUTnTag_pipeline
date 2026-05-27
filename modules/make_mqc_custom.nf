@@ -11,21 +11,30 @@ process MAKE_MQC_CUSTOM {
         mode: 'copy'
 
     input:
-    path(retention_files, stageAs: "retention/*")
-    path(frip_files,      stageAs: "frip/*")
-    path(peak_stats,      stageAs: "peaks/*")
-    path(flagstat_files,  stageAs: "flagstat/*")
+    path retention_files   // plain path — no stageAs; collected list staged flat
+    path frip_files
+    path peak_stats
+    path flagstat_files
 
     output:
     path "read_retention_mqc.tsv",    emit: retention_mqc
     path "frip_scores_mqc.tsv",       emit: frip_mqc
     path "peak_counts_mqc.tsv",       emit: peaks_mqc
     path "mito_fraction_mqc.tsv",     emit: mito_mqc
-    path "*.tsv",                     emit: all_mqc
     path "versions.yml",              emit: versions
 
     script:
+    // Files are staged flat into the work dir; pass '.' as each dir
+    // so the Python script finds them via glob in the working directory.
     """
+    mkdir -p retention frip peaks flagstat
+
+    # Move staged files into named subdirs so the Python script can find them
+    for f in *.read_retention.tsv; do [ -f "\$f" ] && mv "\$f" retention/ || true; done
+    for f in *.frip.txt;           do [ -f "\$f" ] && mv "\$f" frip/      || true; done
+    for f in *_peak_stats.txt;     do [ -f "\$f" ] && mv "\$f" peaks/     || true; done
+    for f in *.flagstat;           do [ -f "\$f" ] && mv "\$f" flagstat/  || true; done
+
     make_mqc_custom.py \\
         --retention_dir  retention/ \\
         --frip_dir       frip/ \\

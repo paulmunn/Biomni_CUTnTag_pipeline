@@ -18,14 +18,16 @@ process VALIDATE_ASSOCIATION {
     path "validation_report.txt",     emit: report
 
     script:
-    def allow_no_ctrl = params.allow_no_control ? "--allow_no_control" : ""
+    def allow_no_ctrl  = params.allow_no_control  ? "--allow_no_control"  : ""
+    def allow_extra    = params.allow_extra_samples ? "--allow_extra"      : ""
     """
     validate_association.py \\
         --association_csv "${association_csv}" \\
         --pairs_tsv       "${pairs_tsv}" \\
         --output          association_validated.csv \\
         --report          validation_report.txt \\
-        ${allow_no_ctrl}
+        ${allow_no_ctrl} \\
+        ${allow_extra}
     """
 
     stub:

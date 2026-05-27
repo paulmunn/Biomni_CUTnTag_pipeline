@@ -2,10 +2,18 @@
 """
 pair_fastqs.py
 ==============
-Scan an input directory for paired-end FASTQ files, detect R1/R2 pairs,
-validate that every R1 has a matching R2, and write a TSV manifest.
+Recursively scan an input directory (and all subdirectories) for
+paired-end FASTQ files, detect R1/R2 pairs, validate that every R1
+has a matching R2, and write a TSV manifest.
 
-Supported naming patterns (auto-detected):
+Directory traversal:
+  Uses Path.rglob() — files at ANY nesting depth are discovered.
+  Common layouts supported:
+    input_dir/sample1_R1.fastq.gz          (flat)
+    input_dir/sample1/sample1_R1.fastq.gz  (one level per sample)
+    input_dir/run1/lane1/sample_R1.fq.gz   (deep nesting)
+
+Supported R1/R2 naming patterns (auto-detected):
   _R1_001.fastq.gz / _R2_001.fastq.gz   (Illumina BCL2FASTQ default)
   _R1.fastq.gz     / _R2.fastq.gz
   _1.fastq.gz      / _2.fastq.gz
@@ -15,6 +23,18 @@ Supported naming patterns (auto-detected):
 
 Output TSV columns:
   sample_id, r1_path, r2_path, input_dir, pattern, status, notes
+
+Note: r1_path and r2_path are always written as absolute paths so that
+downstream Nextflow channels can resolve them correctly regardless of
+which work directory the process runs in.
+
+IMPORTANT — sample_id derivation:
+  The sample_id is derived by stripping ONLY the R1 read suffix from the
+  filename (e.g. _R1.fastq.gz).  Lane suffixes (_L001, _L2, etc.) and
+  sample index suffixes (_S1) are intentionally preserved so that the
+  derived sample_id matches the sample_id column in the association CSV
+  exactly.  Do NOT strip lane suffixes here — the association CSV
+  validator handles normalisation if needed.
 """
 
 import argparse
@@ -38,29 +58,36 @@ PATTERNS = [
      '.R1/.R2',         '.R1',     '.R2'),
 ]
 
-FASTQ_EXTENSIONS = re.compile(
-    r'(_R1_001|_R1|_1|\.R1)(_S\d+)?(_L\d+)?(_R1_001|_R1|_1|\.R1)?\.(fastq|fq)(\.gz)?$',
-    re.IGNORECASE
-)
-
-R1_PATTERN = re.compile(
-    r'(_R1_001|_R1(?!_)|(?<![0-9])_1(?![0-9])|\.R1)\.(fastq|fq)(\.gz)?$',
-    re.IGNORECASE
-)
-
 
 def find_fastq_files(input_dir: Path) -> list:
-    """Recursively find all FASTQ files in input_dir."""
+    """
+    Recursively find all FASTQ files in input_dir and all subdirectories.
+    Uses Path.rglob() so files nested at any depth are discovered.
+    """
     fastq_files = []
     for ext in ['*.fastq.gz', '*.fq.gz', '*.fastq', '*.fq']:
         fastq_files.extend(input_dir.rglob(ext))
-    return sorted(set(fastq_files))
+    fastq_files = sorted(set(fastq_files))
+
+    # Report which subdirectories were found (helps users debug missing samples)
+    subdirs = sorted(set(f.parent for f in fastq_files))
+    if len(subdirs) == 1:
+        print(f"  Searching: {subdirs[0]} (top-level only)", file=sys.stderr)
+    else:
+        print(f"  Searching {len(subdirs)} subdirectories:", file=sys.stderr)
+        for d in subdirs:
+            n = sum(1 for f in fastq_files if f.parent == d)
+            rel = d.relative_to(input_dir) if d != input_dir else Path('.')
+            print(f"    {rel}/  ({n} file(s))", file=sys.stderr)
+
+    return fastq_files
 
 
 def detect_pattern(filename: str) -> tuple:
     """
     Detect which R1 pattern a filename matches.
-    Returns (pattern_name, r1_suffix, r2_suffix) or (None, None, None).
+    Returns (pattern_name, r1_regex, r2_regex, r1_suf, r2_suf)
+    or (None, None, None, None, None) if no R1 pattern matches.
     """
     for r1_regex, r2_regex, pattern_name, r1_suf, r2_suf in PATTERNS:
         if re.search(r1_regex, filename, re.IGNORECASE):
@@ -68,18 +95,22 @@ def detect_pattern(filename: str) -> tuple:
     return None, None, None, None, None
 
 
-def derive_sample_id(filename: str, r1_suffix: str) -> str:
+def derive_sample_id(filename: str, r1_suffix_regex: str) -> str:
     """
-    Derive a clean sample ID from a filename by stripping the R1 suffix
-    and common Illumina lane/sample suffixes.
+    Derive a sample ID from a filename by stripping only the R1 read suffix.
+
+    Design decision: lane suffixes (_L001, _L2, etc.) and sample index
+    suffixes (_S1) are intentionally PRESERVED so that the derived
+    sample_id matches the sample_id column in the association CSV exactly.
+    For example:
+      A1_HEK293A_H3K27me3_10486710_23GVWTLT3_L2_R1.fastq.gz
+      → A1_HEK293A_H3K27me3_10486710_23GVWTLT3_L2
+
+    Do NOT strip lane suffixes here — the association CSV validator
+    handles normalisation as a fallback if needed.
     """
-    # Remove the R1 suffix
-    sample = re.sub(r1_suffix, '', filename, flags=re.IGNORECASE)
-    # Remove trailing _S\d+_L\d+ Illumina suffixes
-    sample = re.sub(r'_S\d+_L\d+$', '', sample)
-    sample = re.sub(r'_S\d+$', '', sample)
-    sample = re.sub(r'_L\d+$', '', sample)
-    # Remove trailing dots/underscores/dashes
+    sample = re.sub(r1_suffix_regex, '', filename, flags=re.IGNORECASE)
+    # Remove any trailing punctuation left by the suffix removal
     sample = sample.rstrip('._-')
     return sample
 
@@ -95,9 +126,8 @@ def pair_fastqs(input_dir: Path, pattern: str = 'auto') -> list:
 
     print(f"Found {len(all_files)} FASTQ files in {input_dir}", file=sys.stderr)
 
-    # Separate R1 files from all files
-    r1_files = []
-    r2_files = []
+    # Separate R1 files from R2/unclassified files
+    r1_files  = []
     unmatched = []
 
     for f in all_files:
@@ -106,14 +136,14 @@ def pair_fastqs(input_dir: Path, pattern: str = 'auto') -> list:
         if pat_name:
             r1_files.append((f, pat_name, r1_regex, r2_regex, r1_suf, r2_suf))
         else:
-            # Check if it's an R2 file
+            # Check if it's an R2 file (expected — don't warn about these)
             is_r2 = any(
-                re.search(r2_regex, fname, re.IGNORECASE)
-                for _, _, r2_regex, _, _ in [
-                    (None, None, r'_R2_001\.(fastq|fq)(\.gz)?$', None, None),
-                    (None, None, r'_R2\.(fastq|fq)(\.gz)?$', None, None),
-                    (None, None, r'_2\.(fastq|fq)(\.gz)?$', None, None),
-                    (None, None, r'\.R2\.(fastq|fq)(\.gz)?$', None, None),
+                re.search(r2_pat, fname, re.IGNORECASE)
+                for r2_pat in [
+                    r'_R2_001\.(fastq|fq)(\.gz)?$',
+                    r'_R2\.(fastq|fq)(\.gz)?$',
+                    r'_2\.(fastq|fq)(\.gz)?$',
+                    r'\.R2\.(fastq|fq)(\.gz)?$',
                 ]
             )
             if not is_r2:
@@ -124,24 +154,22 @@ def pair_fastqs(input_dir: Path, pattern: str = 'auto') -> list:
     for r1_path, pat_name, r1_regex, r2_regex, r1_suf, r2_suf in r1_files:
         sample_id = derive_sample_id(r1_path.name, r1_regex)
 
-        # Construct expected R2 filename
-        r2_name = re.sub(r1_regex, lambda m: m.group(0).replace(r1_suf, r2_suf),
-                         r1_path.name, flags=re.IGNORECASE)
-
-        # Also try simple string replacement for common cases
-        r2_name_simple = r1_path.name
-        for old, new in [('_R1_001', '_R2_001'), ('_R1', '_R2'), ('_1.', '_2.'), ('.R1.', '.R2.')]:
-            if old in r2_name_simple:
-                r2_name_simple = r2_name_simple.replace(old, new, 1)
+        # Construct expected R2 filename by simple suffix replacement
+        r2_name = r1_path.name
+        for old, new in [('_R1_001', '_R2_001'), ('_R1', '_R2'),
+                         ('_1.', '_2.'), ('.R1.', '.R2.')]:
+            if old in r2_name:
+                r2_name = r2_name.replace(old, new, 1)
                 break
 
-        r2_path = r1_path.parent / r2_name_simple
+        r2_path = r1_path.parent / r2_name
 
         if r2_path.exists():
             status = 'OK'
             notes  = ''
         else:
-            # Try searching for R2 in same directory
+            # Fallback: search for any R2 in the same directory whose
+            # derived sample_id matches
             r2_candidates = [
                 f for f in r1_path.parent.iterdir()
                 if re.search(r2_regex, f.name, re.IGNORECASE)
@@ -154,32 +182,35 @@ def pair_fastqs(input_dir: Path, pattern: str = 'auto') -> list:
             elif len(r2_candidates) > 1:
                 r2_path = r2_candidates[0]
                 status  = 'WARNING'
-                notes   = f'Multiple R2 candidates found: {[str(c) for c in r2_candidates]}'
+                notes   = (f'Multiple R2 candidates: '
+                           f'{[str(c) for c in r2_candidates]}')
             else:
                 r2_path = None
                 status  = 'ERROR'
                 notes   = f'No matching R2 found for R1: {r1_path.name}'
 
         results.append({
-            'sample_id':  sample_id,
-            'r1_path':    str(r1_path.resolve()),
-            'r2_path':    str(r2_path.resolve()) if r2_path else 'MISSING',
-            'input_dir':  str(input_dir.resolve()),
-            'pattern':    pat_name,
-            'status':     status,
-            'notes':      notes,
+            'sample_id': sample_id,
+            'r1_path':   str(r1_path.resolve()),
+            'r2_path':   str(r2_path.resolve()) if r2_path else 'MISSING',
+            'input_dir': str(input_dir.resolve()),
+            'pattern':   pat_name,
+            'status':    status,
+            'notes':     notes,
         })
 
-    # Report unmatched files
+    # Warn about files that couldn't be classified
     for f in unmatched:
-        print(f"WARNING: Could not classify file (not R1 or R2): {f}", file=sys.stderr)
+        print(f"WARNING: Could not classify file (not R1 or R2): {f}",
+              file=sys.stderr)
 
     return results
 
 
 def write_tsv(results: list, output_path: str):
     """Write pairing results to TSV."""
-    header = ['sample_id', 'r1_path', 'r2_path', 'input_dir', 'pattern', 'status', 'notes']
+    header = ['sample_id', 'r1_path', 'r2_path', 'input_dir',
+              'pattern', 'status', 'notes']
     with open(output_path, 'w') as fh:
         fh.write('\t'.join(header) + '\n')
         for row in results:
@@ -188,9 +219,14 @@ def write_tsv(results: list, output_path: str):
 
 def write_report(results: list, report_path: str):
     """Write a human-readable pairing report."""
-    n_ok      = sum(1 for r in results if r['status'] == 'OK')
-    n_warn    = sum(1 for r in results if r['status'] == 'WARNING')
-    n_error   = sum(1 for r in results if r['status'] == 'ERROR')
+    n_ok   = sum(1 for r in results if r['status'] == 'OK')
+    n_warn = sum(1 for r in results if r['status'] == 'WARNING')
+    n_err  = sum(1 for r in results if r['status'] == 'ERROR')
+
+    subdirs = sorted(set(
+        str(Path(r['r1_path']).parent)
+        for r in results if r['r1_path'] != 'MISSING'
+    ))
 
     with open(report_path, 'w') as fh:
         fh.write("=" * 60 + "\n")
@@ -199,9 +235,16 @@ def write_report(results: list, report_path: str):
         fh.write(f"Total samples detected : {len(results)}\n")
         fh.write(f"  OK                   : {n_ok}\n")
         fh.write(f"  Warnings             : {n_warn}\n")
-        fh.write(f"  Errors               : {n_error}\n\n")
+        fh.write(f"  Errors               : {n_err}\n\n")
 
-        if n_error > 0:
+        fh.write(f"Subdirectories searched ({len(subdirs)}):\n")
+        for d in subdirs:
+            n = sum(1 for r in results
+                    if str(Path(r['r1_path']).parent) == d)
+            fh.write(f"  {d}/  ({n} sample(s))\n")
+        fh.write("\n")
+
+        if n_err > 0:
             fh.write("ERRORS (pipeline will fail for these samples):\n")
             for r in results:
                 if r['status'] == 'ERROR':
@@ -224,10 +267,9 @@ def write_report(results: list, report_path: str):
                 fh.write(f"           Note: {r['notes']}\n")
             fh.write("\n")
 
-    # Fail hard if any errors
-    if n_error > 0:
+    if n_err > 0:
         print(
-            f"\nERROR: {n_error} sample(s) could not be paired. "
+            f"\nERROR: {n_err} sample(s) could not be paired. "
             "Check pairing_report.txt for details.",
             file=sys.stderr
         )
@@ -250,14 +292,16 @@ def main():
 
     input_dir = Path(args.input_dir)
     if not input_dir.exists():
-        print(f"ERROR: Input directory does not exist: {input_dir}", file=sys.stderr)
+        print(f"ERROR: Input directory does not exist: {input_dir}",
+              file=sys.stderr)
         sys.exit(1)
 
     results = pair_fastqs(input_dir, args.pattern)
     write_tsv(results, args.output)
     write_report(results, args.report)
 
-    print(f"Pairing complete. {len(results)} sample(s) detected.", file=sys.stderr)
+    print(f"Pairing complete. {len(results)} sample(s) detected.",
+          file=sys.stderr)
     print(f"Output TSV: {args.output}", file=sys.stderr)
     print(f"Report:     {args.report}", file=sys.stderr)
 
